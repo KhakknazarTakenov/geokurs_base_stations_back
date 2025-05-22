@@ -9,10 +9,10 @@ app.use(express.json());
 app.use(cors({origin: "*"}));
 
 const sftpConfig = {
-    host: 'storerobots.gamechanger.kz',
-    port: 22,
-    username: 'root',
-    password: 'GaMeChangerSERVE@2024'
+    host: '',
+    port: ,
+    username: '',
+    password: ''
 };
 
 const BASE_URL = "/geokurs_base_stations/"
