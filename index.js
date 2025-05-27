@@ -507,6 +507,201 @@ app.post(BASE_URL + 'handle_new_station_creation', async (req, res) => {
     }
 });
 
+app.post(BASE_URL + 'webhook_handle_station_edit', async (req, res) => {
+    let deviceId = req.query.deviceId || req.query.params?.deviceId || null;
+    const sftp = new Client();
+
+    try {
+        // Логируем входящий запрос
+        if (!deviceId) {
+            throw new Error("Device ID not found");
+        }
+        typeof deviceId === 'string' ? deviceId = deviceId.toLowerCase() : null;
+        deviceId.includes("tb1_") ? deviceId = deviceId.replace("tb1_", "") : null;
+        console.log('Device ID:', deviceId);
+
+        const bxLinkDecrypted = await decryptText(process.env.BX_LINK, process.env.CRYPTO_KEY, process.env.CRYPTO_IV);
+        await sftp.connect(sftpConfig);
+
+        const device = await (await fetch(`${bxLinkDecrypted}/crm.item.get?entityTypeId=177&id=${deviceId}`)).json();
+        if (device.error) {
+            throw new Error(`${device.error_description}`);
+        }
+        const deviceData = device.result.item;
+
+        const chosenStations = deviceData.ufCrm6_1730973093114;
+        const login = deviceData.ufCrm6_1730979706200;
+        const password = deviceData.ufCrm6_1730979718324;
+        const group = deviceData.ufCrm6_1740377767444;
+
+        if (!group) {
+            throw new Error('Group (ufCrm6_1740377767444) not found for device');
+        }
+
+        const filterString = chosenStations.map(station => `filter[ufCrm6_1747752804167][]=${encodeURIComponent(station)}`).join('&');
+        console.log(filterString)
+        const stationsList = await (await fetch(`${bxLinkDecrypted}/crm.item.list?entityTypeId=177&${filterString}`)).json();
+
+        if (stationsList.error) {
+            throw new Error(`${stationsList.error}`);
+        }
+
+        const stationsListData = stationsList.result.items.map(item => {
+            return {
+                id: item.id,
+                title: item.title,
+                ufCrm6_1747732525842: item.ufCrm6_1747732525842, // /popravka
+                ufCrm6_1747732550194: item.ufCrm6_1747732550194, // /popravka
+                ufCrm6_1747732575237: item.ufCrm6_1747732575237, // /popravka
+                ufCrm6_1747732606707: item.ufCrm6_1747732606707, // /popravka
+                ufCrm6_1747732721580: item.ufCrm6_1747732721580  // #Name
+            };
+        });
+
+        // Извлекаем коды станций из stationsListData
+        const activeStationCodes = stationsListData
+            .map(station => station.ufCrm6_1747732721580)
+            .filter(code => code && code.startsWith('#'));
+
+        // Чтение текущего содержимого clientmounts.aut
+        const clientmountsPath = '/home/tmp/clientmounts.aut'; // Укажи правильный путь к файлу
+        let clientmountsContent = await sftp.get(clientmountsPath).then(data => data.toString()).catch(() => '');
+        let clientmountsLines = clientmountsContent.trim().split('\n').filter(line => line.trim());
+
+        // 1. Добавляем или обновляем записи для станций из stationsListData
+        for (const station of stationsListData) {
+            const clientmountField = station.ufCrm6_1747732721580; // Код станции (#Aktau)
+            if (!clientmountField || !clientmountField.startsWith('#')) {
+                continue;
+            }
+
+            // Извлекаем все поправки отдельно
+            const formats = [
+                station.ufCrm6_1747732525842.replace(":", ""),
+                station.ufCrm6_1747732550194.replace(":", ""),
+                station.ufCrm6_1747732575237.replace(":", ""),
+                station.ufCrm6_1747732606707.replace(":", "")
+            ].filter(format => format); // Фильтруем пустые значения
+
+            if (formats.length === 0) {
+                console.warn(`No formats provided for station ${station.id}, skipping...`);
+                continue;
+            }
+
+            // Проверяем, есть ли уже такой код станции
+            const codeExists = clientmountsLines.some(line => line === clientmountField);
+            if (codeExists) {
+                // Если код уже есть, обновляем существующие поправки или добавляем новые
+                const codeIndex = clientmountsLines.indexOf(clientmountField);
+                const endOfBlockIndex = clientmountsLines.slice(codeIndex + 1).findIndex(line => line.startsWith('#'));
+                const blockEnd = endOfBlockIndex === -1 ? clientmountsLines.length : codeIndex + 1 + endOfBlockIndex;
+                const stationBlock = clientmountsLines.slice(codeIndex, blockEnd);
+
+                const existingFormats = stationBlock
+                    .filter(line => line.startsWith('/'))
+                    .map(line => line.split(':')[0]);
+
+                let updatedLines = [...clientmountsLines.slice(0, codeIndex)];
+                updatedLines.push(clientmountField); // Добавляем код станции
+
+                for (const format of formats) {
+                    const existingFormatLine = stationBlock.find(line => line.startsWith(format));
+                    if (existingFormatLine) {
+                        // Если поправка уже существует, добавляем новую группу, исключая дубликаты
+                        const existingGroups = existingFormatLine.split(':')[1].split(',');
+                        const allGroups = [...new Set([...existingGroups, group])]; // Исключаем дубликаты
+                        updatedLines.push(`${format}:${allGroups.join(',')}`);
+                    } else {
+                        // Если поправки нет, добавляем новую запись
+                        updatedLines.push(`${format}:${group}`);
+                    }
+                }
+
+                updatedLines.push(...clientmountsLines.slice(blockEnd));
+                clientmountsLines = updatedLines;
+            } else {
+                // Если кода нет, добавляем его и все поправки
+                const newEntries = formats.map(format => `${format}:${group}`);
+                clientmountsLines.push(clientmountField, ...newEntries);
+            }
+        }
+
+        // 2. Удаляем группы из станций, которых больше нет в stationsListData
+        let updatedLines = [];
+        let currentCode = null;
+        let currentBlock = [];
+
+        for (let i = 0; i < clientmountsLines.length; i++) {
+            const line = clientmountsLines[i];
+
+            if (line.startsWith('#')) {
+                // Если у нас есть предыдущий блок, обрабатываем его
+                if (currentCode) {
+                    if (activeStationCodes.includes(currentCode)) {
+                        // Если станция всё ещё активна, сохраняем её
+                        updatedLines.push(currentCode);
+                        updatedLines.push(...currentBlock);
+                    } else {
+                        // Если станции больше нет, удаляем группу текущего прибора
+                        let updatedBlock = [];
+                        for (const formatLine of currentBlock) {
+                            const [format, groups] = formatLine.split(':');
+                            let groupList = groups.split(',');
+                            groupList = groupList.filter(g => g !== group); // Удаляем группу прибора
+                            if (groupList.length > 0) {
+                                updatedBlock.push(`${format}:${groupList.join(',')}`);
+                            }
+                        }
+                        // Если после удаления группы остались записи, сохраняем станцию
+                        if (updatedBlock.length > 0) {
+                            updatedLines.push(currentCode);
+                            updatedLines.push(...updatedBlock);
+                        }
+                    }
+                }
+                // Начинаем новый блок
+                currentCode = line;
+                currentBlock = [];
+            } else if (currentCode) {
+                currentBlock.push(line);
+            }
+        }
+
+        // Обрабатываем последний блок
+        if (currentCode) {
+            if (activeStationCodes.includes(currentCode)) {
+                updatedLines.push(currentCode);
+                updatedLines.push(...currentBlock);
+            } else {
+                let updatedBlock = [];
+                for (const formatLine of currentBlock) {
+                    const [format, groups] = formatLine.split(':');
+                    let groupList = groups.split(',');
+                    groupList = groupList.filter(g => g !== group); // Удаляем группу прибора
+                    if (groupList.length > 0) {
+                        updatedBlock.push(`${format}:${groupList.join(',')}`);
+                    }
+                }
+                if (updatedBlock.length > 0) {
+                    updatedLines.push(currentCode);
+                    updatedLines.push(...updatedBlock);
+                }
+            }
+        }
+
+        clientmountsLines = updatedLines;
+        clientmountsContent = clientmountsLines.join('\n') + '\n';
+        await sftp.put(Buffer.from(clientmountsContent), clientmountsPath);
+
+        res.status(200).send('Webhook processed successfully');
+    } catch (error) {
+        await logMessage(LOG_TYPES.E, 'webhook_handle_station_edit', error);
+        res.status(500).json({ error: error.message });
+    } finally {
+        await sftp.end();
+    }
+});
+
 app.post(BASE_URL + "init/", async (req, res) => {
     try {
         const bxLink = req.body.bx_link;
