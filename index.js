@@ -210,7 +210,7 @@ app.post(BASE_URL + 'activate', async (req, res) => {
 
         // Валидация входных данных
         if (!serial || !stations || !Array.isArray(stations)) {
-            throw new Error('Invalid input: serial, and stations are required, and stations must be an array');
+            throw new Error('Invalid input: serial and stations are required, and stations must be an array');
         }
 
         for (const station of stations) {
@@ -221,7 +221,7 @@ app.post(BASE_URL + 'activate', async (req, res) => {
 
         // Чтение и нормализация содержимого USERS.aut
         let usersContent = await sftp.get(usersAutPath).then(data => data.toString()).catch(() => '');
-        let usersLines = usersContent.trim().split('\n').filter(line => line.trim()); // Разделяем на строки и убираем пустые
+        let usersLines = usersContent.trim().split('\n').filter(line => line.trim());
 
         // Проверка на дубли
         if (usersLines.some(line => line.startsWith(`${finalLogin}:`))) {
@@ -230,17 +230,17 @@ app.post(BASE_URL + 'activate', async (req, res) => {
 
         // Добавляем новую строку
         usersLines.push(`${finalLogin}:${finalPassword}`);
-        usersContent = usersLines.join('\n') + '\n'; // Собираем строки с переносами
+        usersContent = usersLines.join('\n') + '\n';
         await sftp.put(Buffer.from(usersContent), usersAutPath);
         await logMessage(LOG_TYPES.I, 'manageDevice 56', `Added user ${finalLogin}:${finalPassword} to USERS.aut for serial ${serial}`);
 
         // Чтение и нормализация содержимого GROUPS.aut
         let groupsContent = await sftp.get(groupsAutPath).then(data => data.toString()).catch(() => '');
-        let groupsLines = groupsContent.trim().split('\n').filter(line => line.trim()); // Разделяем на строки и убираем пустые
+        let groupsLines = groupsContent.trim().split('\n').filter(line => line.trim());
 
         // Добавляем новую строку
         groupsLines.push(`${finalGroup}:${finalLogin}:1`);
-        groupsContent = groupsLines.join('\n') + '\n'; // Собираем строки с переносами
+        groupsContent = groupsLines.join('\n') + '\n';
         await sftp.put(Buffer.from(groupsContent), groupsAutPath);
         await logMessage(LOG_TYPES.I, 'manageDevice 62', `Added group ${finalGroup}:${finalLogin}:1 to GROUPS.aut for serial ${serial}`);
 
@@ -259,7 +259,9 @@ app.post(BASE_URL + 'activate', async (req, res) => {
                 }
             } else if (currentStation && line) {
                 const [format, groups = ''] = line.split(':');
-                stationsMap.get(currentStation).set(format, groups.split(',').filter(g => g));
+                // Убедимся, что формат начинается с /
+                const normalizedFormat = format.startsWith('/') ? format : `/${format}`;
+                stationsMap.get(currentStation).set(normalizedFormat, groups.split(',').filter(g => g));
             }
         }
 
@@ -270,15 +272,17 @@ app.post(BASE_URL + 'activate', async (req, res) => {
                 stationsMap.set(stationName, new Map());
             }
             const formatsMap = stationsMap.get(stationName);
-            for (const format of station.formats) {
-                // Убедимся, что форматы переданы без `/` и `:`
+            for (let format of station.formats) {
+                // Убедимся, что форматы переданы без / и :
                 const cleanFormat = format.startsWith('/') ? format.slice(1) : format;
                 const finalFormat = cleanFormat.endsWith(':') ? cleanFormat.slice(0, -1) : cleanFormat;
-                const groups = formatsMap.get(finalFormat) || [];
+                // Добавляем / в начало
+                const normalizedFormat = `/${finalFormat}`;
+                const groups = formatsMap.get(normalizedFormat) || [];
                 if (!groups.includes(finalGroup)) {
                     groups.push(finalGroup);
                 }
-                formatsMap.set(finalFormat, groups);
+                formatsMap.set(normalizedFormat, groups);
             }
         }
 
@@ -289,7 +293,7 @@ app.post(BASE_URL + 'activate', async (req, res) => {
                 updatedLines.push(`#${station}`);
                 for (const [format, groups] of formatsMap) {
                     if (groups.length > 0) {
-                        updatedLines.push(`${format}:${groups.join(',')},`);
+                        updatedLines.push(`${format}:${groups.join(',')}`);
                     }
                 }
             }
@@ -538,25 +542,62 @@ app.post(BASE_URL + 'webhook_handle_station_edit', async (req, res) => {
             throw new Error('Group (ufCrm6_1740377767444) not found for device');
         }
 
+        console.log('Chosen stations count:', chosenStations.length);
+
+        // Получаем все станции с пагинацией
         const filterString = chosenStations.map(station => `filter[ufCrm6_1747752804167][]=${encodeURIComponent(station)}`).join('&');
-        console.log(filterString)
-        const stationsList = await (await fetch(`${bxLinkDecrypted}/crm.item.list?entityTypeId=177&${filterString}`)).json();
+        let allStations = [];
+        let start = 0;
+        let total = 0;
 
-        if (stationsList.error) {
-            throw new Error(`${stationsList.error}`);
-        }
+        do {
+            const url = `${bxLinkDecrypted}/crm.item.list?entityTypeId=177&${filterString}&start=${start}`;
+            const response = await fetch(url);
+            const stationsList = await response.json();
 
-        const stationsListData = stationsList.result.items.map(item => {
+            if (stationsList.error) {
+                throw new Error(`${stationsList.error}`);
+            }
+
+            const items = stationsList.result.items || [];
+            allStations = allStations.concat(items);
+            total = stationsList.total || 0;
+            start += 50; // Bitrix24 возвращает максимум 50 записей за раз
+            console.log(`Fetched ${items.length} stations, total: ${total}, start: ${start}`);
+        } while (start < total);
+
+        console.log('Total stations fetched:', allStations.length);
+
+        const stationsListData = allStations.map(item => {
+            // Нормализуем форматы: добавляем / в начало, если его нет, и убираем : в конце
+            const normalizeFormat = (format) => {
+                if (!format || typeof format !== 'string') return null;
+                format = format.trim();
+                if (format.endsWith(':')) format = format.slice(0, -1);
+                return format.startsWith('/') ? format : `/${format}`;
+            };
+
             return {
                 id: item.id,
                 title: item.title,
-                ufCrm6_1747732525842: item.ufCrm6_1747732525842, // /popravka
-                ufCrm6_1747732550194: item.ufCrm6_1747732550194, // /popravka
-                ufCrm6_1747732575237: item.ufCrm6_1747732575237, // /popravka
-                ufCrm6_1747732606707: item.ufCrm6_1747732606707, // /popravka
+                ufCrm6_1747732525842: normalizeFormat(item.ufCrm6_1747732525842), // /popravka
+                ufCrm6_1747732550194: normalizeFormat(item.ufCrm6_1747732550194), // /popravka
+                ufCrm6_1747732575237: normalizeFormat(item.ufCrm6_1747732575237), // /popravka
+                ufCrm6_1747732606707: normalizeFormat(item.ufCrm6_1747732606707), // /popravka
                 ufCrm6_1747732721580: item.ufCrm6_1747732721580  // #Name
             };
+        }).filter(station => {
+            // Пропускаем станции, у которых нет ни одного корректного формата
+            const formats = [
+                station.ufCrm6_1747732525842,
+                station.ufCrm6_1747732550194,
+                station.ufCrm6_1747732575237,
+                station.ufCrm6_1747732606707
+            ].filter(format => format);
+            return formats.length > 0;
         });
+
+        // console.log('Stations list data:', stationsListData);
 
         // Извлекаем коды станций из stationsListData
         const activeStationCodes = stationsListData
@@ -564,7 +605,7 @@ app.post(BASE_URL + 'webhook_handle_station_edit', async (req, res) => {
             .filter(code => code && code.startsWith('#'));
 
         // Чтение текущего содержимого clientmounts.aut
-        const clientmountsPath = '/home/tmp/clientmounts.aut'; // Укажи правильный путь к файлу
+        const clientmountsPath = '/home/tmp/clientmounts.aut';
         let clientmountsContent = await sftp.get(clientmountsPath).then(data => data.toString()).catch(() => '');
         let clientmountsLines = clientmountsContent.trim().split('\n').filter(line => line.trim());
 
@@ -572,15 +613,16 @@ app.post(BASE_URL + 'webhook_handle_station_edit', async (req, res) => {
         for (const station of stationsListData) {
             const clientmountField = station.ufCrm6_1747732721580; // Код станции (#Aktau)
             if (!clientmountField || !clientmountField.startsWith('#')) {
+                console.warn(`Invalid or missing clientmountField for station ${station.id}, skipping...`);
                 continue;
             }
 
             // Извлекаем все поправки отдельно
             const formats = [
-                station.ufCrm6_1747732525842.replace(":", ""),
-                station.ufCrm6_1747732550194.replace(":", ""),
-                station.ufCrm6_1747732575237.replace(":", ""),
-                station.ufCrm6_1747732606707.replace(":", "")
+                station.ufCrm6_1747732525842,
+                station.ufCrm6_1747732550194,
+                station.ufCrm6_1747732575237,
+                station.ufCrm6_1747732606707
             ].filter(format => format); // Фильтруем пустые значения
 
             if (formats.length === 0) {
@@ -608,7 +650,7 @@ app.post(BASE_URL + 'webhook_handle_station_edit', async (req, res) => {
                     const existingFormatLine = stationBlock.find(line => line.startsWith(format));
                     if (existingFormatLine) {
                         // Если поправка уже существует, добавляем новую группу, исключая дубликаты
-                        const existingGroups = existingFormatLine.split(':')[1].split(',');
+                        const existingGroups = existingFormatLine.split(':')[1] ? existingFormatLine.split(':')[1].split(',') : [];
                         const allGroups = [...new Set([...existingGroups, group])]; // Исключаем дубликаты
                         updatedLines.push(`${format}:${allGroups.join(',')}`);
                     } else {
@@ -646,7 +688,7 @@ app.post(BASE_URL + 'webhook_handle_station_edit', async (req, res) => {
                         let updatedBlock = [];
                         for (const formatLine of currentBlock) {
                             const [format, groups] = formatLine.split(':');
-                            let groupList = groups.split(',');
+                            let groupList = groups ? groups.split(',') : [];
                             groupList = groupList.filter(g => g !== group); // Удаляем группу прибора
                             if (groupList.length > 0) {
                                 updatedBlock.push(`${format}:${groupList.join(',')}`);
@@ -676,7 +718,7 @@ app.post(BASE_URL + 'webhook_handle_station_edit', async (req, res) => {
                 let updatedBlock = [];
                 for (const formatLine of currentBlock) {
                     const [format, groups] = formatLine.split(':');
-                    let groupList = groups.split(',');
+                    let groupList = groups ? groups.split(',') : [];
                     groupList = groupList.filter(g => g !== group); // Удаляем группу прибора
                     if (groupList.length > 0) {
                         updatedBlock.push(`${format}:${groupList.join(',')}`);
@@ -692,6 +734,7 @@ app.post(BASE_URL + 'webhook_handle_station_edit', async (req, res) => {
         clientmountsLines = updatedLines;
         clientmountsContent = clientmountsLines.join('\n') + '\n';
         await sftp.put(Buffer.from(clientmountsContent), clientmountsPath);
+        console.log(`Updated clientmounts.aut: removed group ${group} from stations not in stationsListData`);
 
         res.status(200).send('Webhook processed successfully');
     } catch (error) {
